@@ -3,4 +3,6 @@
 *.bin
 ckpts/*.pth
 ckpts/*.pt
-ckpts/*.bin
+ckpts/*.binckpts/*.bin
+ckpts/*.pt
+ckpts/*.pth
