@@ -1,2 +1,6 @@
-.git
-.idea
+*.pth
+*.pt
+*.bin
+ckpts/*.pth
+ckpts/*.pt
+ckpts/*.bin

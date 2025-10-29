@@ -75,7 +75,7 @@ def get_args(description='CLIP4Clip on Retrieval Task'):
     parser.add_argument("--datatype", default="msrvtt", type=str, help="Point the dataset to finetune.")
 
     parser.add_argument("--world_size", default=0, type=int, help="distribted training")
-    parser.add_argument("--local_rank", default=0, type=int, help="distribted training")
+    parser.add_argument("--local-rank", default=0, type=int, help="distribted training")
     parser.add_argument("--rank", default=0, type=int, help="distribted training")
     parser.add_argument('--coef_lr', type=float, default=1., help='coefficient for bert branch.')
     parser.add_argument('--use_mil', action='store_true', help="Whether use MIL as Miech et. al. (2020).")
@@ -150,6 +150,7 @@ def set_seed_logger(args):
 
     return args
 
+"""
 def init_device(args, local_rank):
     global logger
 
@@ -164,6 +165,34 @@ def init_device(args, local_rank):
             args.batch_size, args.n_gpu, args.batch_size_val, args.n_gpu))
 
     return device, n_gpu
+"""
+
+def init_device(args, local_rank):
+    global logger
+
+    # ensure local_rank is int
+    local_rank = int(local_rank)
+
+    if torch.cuda.is_available():
+        # 把当前进程绑定到对应的本地 GPU
+        torch.cuda.set_device(local_rank)
+        device = torch.device("cuda", local_rank)
+        n_gpu = torch.cuda.device_count()
+    else:
+        device = torch.device("cpu")
+        n_gpu = 0
+
+    logger.info("device: {} n_gpu: {}".format(device, n_gpu))
+    args.n_gpu = n_gpu
+
+    # 如果有 GPU，检查 batch_size 是否和 GPU 数匹配（原逻辑）
+    if n_gpu > 0:
+        if args.batch_size % args.n_gpu != 0 or args.batch_size_val % args.n_gpu != 0:
+            raise ValueError("Invalid batch_size/batch_size_val and n_gpu parameter: {}%{} and {}%{}, should be == 0".format(
+                args.batch_size, args.n_gpu, args.batch_size_val, args.n_gpu))
+
+    return device, n_gpu
+
 
 def init_model(args, device, n_gpu, local_rank):
 
@@ -211,8 +240,21 @@ def prep_optimizer(args, model, num_train_optimization_steps, device, n_gpu, loc
                          t_total=num_train_optimization_steps, weight_decay=weight_decay,
                          max_grad_norm=1.0)
 
-    model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[local_rank],
-                                                      output_device=local_rank, find_unused_parameters=True)
+    # model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[local_rank],
+    #                                                  output_device=local_rank, find_unused_parameters=True)
+    # 确保 model 在正确的 device 上（init_model 通常已做，但这里再保证）
+    if device.type == 'cuda':
+        torch.cuda.set_device(int(local_rank))
+    model.to(device)
+
+    # 最后 wrap DDP（确保 device_ids/output_device 使用 local_rank）
+    model = torch.nn.parallel.DistributedDataParallel(
+        model,
+        device_ids=[int(local_rank)],
+        output_device=int(local_rank),
+        find_unused_parameters=True
+    )
+
 
     return optimizer, scheduler, model
 
@@ -462,6 +504,17 @@ def eval_epoch(args, model, test_dataloader, device, n_gpu):
 def main():
     global logger
     args = get_args()
+
+    # ------------------ torchrun / LOCAL_RANK 兼容补丁 ------------------
+    # 确保 args.local_rank 来自 torchrun 设置的环境变量 LOCAL_RANK（优先使用 env）
+    import os
+    # 如果 torchrun 启动，会在环境变量中设置 LOCAL_RANK；优先取该值
+    args.local_rank = int(os.environ.get("LOCAL_RANK", getattr(args, "local_rank", 0)))
+
+    # 打印进程使用的本地 rank（有助于调试）
+    print(f"[main] LOCAL_RANK env -> args.local_rank = {args.local_rank}")
+    # -------------------------------------------------------------------
+
     args = set_seed_logger(args)
     device, n_gpu = init_device(args, args.local_rank)
 
@@ -543,11 +596,52 @@ def main():
         # resume optimizer state besides loss to continue train
         ## ##############################################################
         resumed_epoch = 0
-        if args.resume_model:
+        if args.resume_model is not None and os.path.exists(args.resume_model):
+            print(f"=> Loading checkpoint from {args.resume_model}")
+
             checkpoint = torch.load(args.resume_model, map_location='cpu')
-            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-            resumed_epoch = checkpoint['epoch']+1
-            resumed_loss = checkpoint['loss']
+
+            # ---- Restore Model ----
+            if 'model_state_dict' in checkpoint:
+                model.load_state_dict(checkpoint['model_state_dict'], strict=False)
+                print("=> Model weights loaded (wrapped state_dict).")
+            else:
+                try:
+                    model.load_state_dict(checkpoint, strict=False)
+                    print("=> Model weights loaded (raw state_dict).")
+                except:
+                    print("❌ ERROR: Can't load model weights from checkpoint")
+                    raise
+
+            # ---- Restore Optimizer ----
+            if 'optimizer_state_dict' in checkpoint:
+                try:
+                    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                    print("=> Optimizer state restored.")
+                except Exception as e:
+                    print(f"=> WARNING: Failed to restore optimizer. Training optimizer fresh. Reason: {e}")
+            else:
+                print("=> No optimizer state in checkpoint. Starting new optimizer.")
+
+            # ---- Restore Epoch ----
+            if 'epoch' in checkpoint:
+                resumed_epoch = int(checkpoint['epoch']) + 1
+                print(f"=> Resuming from epoch {resumed_epoch}")
+            else:
+                resumed_epoch = 1
+                print("=> No epoch stored in checkpoint. Starting from epoch 1")
+
+            # ---- Restore Scheduler if exists ----
+            if 'scheduler_state_dict' in checkpoint:
+                try:
+                    scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+                    print("=> Scheduler state restored.")
+                except:
+                    print("=> WARNING: Scheduler state failed to load, using fresh scheduler.")
+        else:
+            resumed_epoch = 0
+            print("=> No resume checkpoint provided. Training from scratch.")
+            # resumed_loss = checkpoint['loss']
         
         global_step = 0
         for epoch in range(resumed_epoch, args.epochs):
